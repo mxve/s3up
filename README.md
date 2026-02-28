@@ -4,7 +4,7 @@ because there surely is need for another s3 uploader
 
 ## usage
 
-set env vars in either .env in work dir or in yell
+set env vars in either .env in work dir or in shell
 
 ```env
 AWS_ACCESS_KEY_ID=
