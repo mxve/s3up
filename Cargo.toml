@@ -5,6 +5,7 @@ edition = "2024"
 description = "lil fella putting files into buckets"
 license = "MIT"
 keywords = ["s3", "s3-client"]
+repository = "https://github.com/mxve/s3up"
 
 [dependencies]
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
