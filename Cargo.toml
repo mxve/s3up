@@ -2,6 +2,9 @@
 name = "s3up"
 version = "0.1.0"
 edition = "2024"
+description = "lil fella putting files into buckets"
+license = "MIT"
+keywords = ["s3", "s3-client"]
 
 [dependencies]
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
