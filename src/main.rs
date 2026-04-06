@@ -1,12 +1,17 @@
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use std::sync::Arc;
 use std::{env, path::Path, process::ExitCode};
+use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
 #[cfg(test)]
 mod tests;
+
+const MULTIPART_THRESHOLD: u64 = 100 * 1024 * 1024;
+const PART_SIZE: u64 = 100 * 1024 * 1024;
 
 fn require_env(key: &str) -> Option<String> {
     env::var(key)
@@ -78,6 +83,113 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args, String> {
     })
 }
 
+async fn upload_file(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    file_path: &str,
+    key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = Path::new(file_path);
+    let file_size = tokio::fs::metadata(path).await?.len();
+    let content_type = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string();
+
+    if file_size < MULTIPART_THRESHOLD {
+        let body = ByteStream::from_path(path).await?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_type(&content_type)
+            .body(body)
+            .send()
+            .await?;
+        return Ok(());
+    }
+
+    let create = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .content_type(&content_type)
+        .send()
+        .await?;
+    let upload_id = create
+        .upload_id()
+        .ok_or("create_multipart_upload returned no upload_id")?;
+
+    let result = upload_parts(client, bucket, key, upload_id, path, file_size).await;
+
+    if let Err(e) = result {
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+async fn upload_parts(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    path: &Path,
+    file_size: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut completed_parts: Vec<CompletedPart> = Vec::new();
+    let mut bytes_remaining = file_size;
+    let mut part_number: i32 = 1;
+
+    while bytes_remaining > 0 {
+        let chunk_size = bytes_remaining.min(PART_SIZE) as usize;
+        let mut buf = vec![0u8; chunk_size];
+        file.read_exact(&mut buf).await?;
+
+        let part = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(buf))
+            .send()
+            .await?;
+
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(part.e_tag().unwrap_or_default())
+                .build(),
+        );
+
+        bytes_remaining -= chunk_size as u64;
+        part_number += 1;
+    }
+
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let _ = dotenvy::from_path(".env");
@@ -134,28 +246,13 @@ async fn main() -> ExitCode {
                 return false;
             }
 
-            let ctx = mime_guess::from_path(path)
+            let content_type = mime_guess::from_path(path)
                 .first_or_octet_stream()
                 .to_string();
-            let body = match ByteStream::from_path(path).await {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("error reading {file_path}: {e}");
-                    return false;
-                }
-            };
 
-            match client
-                .put_object()
-                .bucket(bucket.as_ref())
-                .key(&key)
-                .content_type(&ctx)
-                .body(body)
-                .send()
-                .await
-            {
+            match upload_file(&client, &bucket, &file_path, &key).await {
                 Ok(_) => {
-                    println!("uploaded: {file_path} -> {bucket}/{key} ({ctx})");
+                    println!("uploaded: {file_path} -> {bucket}/{key} ({content_type})");
                     true
                 }
                 Err(e) => {
