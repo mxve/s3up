@@ -3,6 +3,13 @@
 because there surely is need for another s3 uploader.  
 content-type detection using mime_guess so solely based on file extension
 
+## install
+
+if you have rust/cargo installed on your system
+`cargo install s3up`
+
+otherwise download the appropriate binary from the [latest release](https://github.com/mxve/s3up/releases/latest/)
+
 ## usage
 
 set env vars in either .env in work dir or in shell
