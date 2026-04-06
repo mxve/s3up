@@ -29,7 +29,11 @@ s3up <file> <file> <file> <file> <file> <file> <file> <file> <file> <file> <file
 
 - args go before files
 - `--rename` - parse files as pairs of filename & s3_key
-- `--concurrency <num>` - upload files concurrently as indicated by the name of the arg being concurrency if you couldnt tell this means uploading multiple files at the same time i know this concept may be foreign and sound outright crazy but thats just how i am #yolo iykwim (default is 1)
+- `--concurrency <n>` - number of files to upload concurrently (default: 1)
+- `--part-size <MB>` - multipart part size in megabytes (default: 16)
+- `--part-concurrency <n>` - number of parts to upload concurrently per file (default: 16)
+
+files over 32 MB are uploaded using multipart. parts are uploaded concurrently up to `--part-concurrency`.
 
 ```bash
 s3up --rename --concurrency 8 local.txt remote.txt

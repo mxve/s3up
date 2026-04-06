@@ -2,16 +2,18 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use std::io::SeekFrom;
 use std::sync::Arc;
 use std::{env, path::Path, process::ExitCode};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Semaphore;
 
 #[cfg(test)]
 mod tests;
 
-const MULTIPART_THRESHOLD: u64 = 100 * 1024 * 1024;
-const PART_SIZE: u64 = 100 * 1024 * 1024;
+const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
+const DEFAULT_PART_SIZE_MB: u64 = 16;
+const DEFAULT_PART_CONCURRENCY: usize = 16;
 
 fn require_env(key: &str) -> Option<String> {
     env::var(key)
@@ -19,15 +21,24 @@ fn require_env(key: &str) -> Option<String> {
         .ok()
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MultipartConfig {
+    pub part_size: u64,
+    pub part_concurrency: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct Args {
     pub concurrency: usize,
+    pub multipart: MultipartConfig,
     pub uploads: Vec<(String, String)>,
 }
 
 pub(crate) fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut rename = false;
     let mut concurrency = 1;
+    let mut part_size = DEFAULT_PART_SIZE_MB * 1024 * 1024;
+    let mut part_concurrency = DEFAULT_PART_CONCURRENCY;
     let mut idx = 0;
 
     while let Some(arg) = args.get(idx) {
@@ -45,6 +56,33 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args, String> {
                 }
                 idx += 1;
             }
+            "--part-size" => {
+                let val = args
+                    .get(idx + 1)
+                    .ok_or("error: --part-size requires a value")?;
+                let mb = val.parse::<u64>().map_err(|_| {
+                    format!("error: --part-size value must be a positive integer, got '{val}'")
+                })?;
+                if mb == 0 {
+                    return Err("error: --part-size must be at least 1".into());
+                }
+                part_size = mb * 1024 * 1024;
+                idx += 1;
+            }
+            "--part-concurrency" => {
+                let val = args
+                    .get(idx + 1)
+                    .ok_or("error: --part-concurrency requires a value")?;
+                part_concurrency = val.parse::<usize>().map_err(|_| {
+                    format!(
+                        "error: --part-concurrency value must be a positive integer, got '{val}'"
+                    )
+                })?;
+                if part_concurrency == 0 {
+                    return Err("error: --part-concurrency must be at least 1".into());
+                }
+                idx += 1;
+            }
             _ => break,
         }
         idx += 1;
@@ -52,7 +90,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args, String> {
 
     let file_args = &args[idx..];
     if file_args.is_empty() {
-        return Err("usage: s3up [--rename] [--concurrency <n>] <file> [file2 ...]\n       s3up --rename [--concurrency <n>] <local_file> <s3_key> [<local_file> <s3_key> ...]".into());
+        return Err("usage: s3up [--rename] [--concurrency <n>] [--part-size <MB>] [--part-concurrency <n>] <file> [file2 ...]\n       s3up --rename [--concurrency <n>] [--part-size <MB>] [--part-concurrency <n>] <local_file> <s3_key> [<local_file> <s3_key> ...]".into());
     }
 
     if rename && !file_args.len().is_multiple_of(2) {
@@ -79,6 +117,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args, String> {
 
     Ok(Args {
         concurrency,
+        multipart: MultipartConfig {
+            part_size,
+            part_concurrency,
+        },
         uploads,
     })
 }
@@ -88,6 +130,7 @@ async fn upload_file(
     bucket: &str,
     file_path: &str,
     key: &str,
+    multipart: MultipartConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(file_path);
     let file_size = tokio::fs::metadata(path).await?.len();
@@ -119,7 +162,7 @@ async fn upload_file(
         .upload_id()
         .ok_or("create_multipart_upload returned no upload_id")?;
 
-    let result = upload_parts(client, bucket, key, upload_id, path, file_size).await;
+    let result = upload_parts(client, bucket, key, upload_id, path, file_size, multipart).await;
 
     if let Err(e) = result {
         let _ = client
@@ -142,43 +185,67 @@ async fn upload_parts(
     upload_id: &str,
     path: &Path,
     file_size: u64,
+    multipart: MultipartConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut completed_parts: Vec<CompletedPart> = Vec::new();
-    let mut bytes_remaining = file_size;
-    let mut part_number: i32 = 1;
+    let num_parts = file_size.div_ceil(multipart.part_size);
+    let sem = Arc::new(Semaphore::new(multipart.part_concurrency));
+    let client = Arc::new(client.clone());
+    let bucket = Arc::new(bucket.to_owned());
+    let key = Arc::new(key.to_owned());
+    let upload_id = Arc::new(upload_id.to_owned());
+    let path = Arc::new(path.to_owned());
 
-    while bytes_remaining > 0 {
-        let chunk_size = bytes_remaining.min(PART_SIZE) as usize;
-        let mut buf = vec![0u8; chunk_size];
-        file.read_exact(&mut buf).await?;
+    let mut handles = Vec::with_capacity(num_parts as usize);
 
-        let part = client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(ByteStream::from(buf))
-            .send()
-            .await?;
+    for part_number in 1..=num_parts {
+        let offset = (part_number - 1) * multipart.part_size;
+        let chunk_size = multipart.part_size.min(file_size - offset) as usize;
 
-        completed_parts.push(
-            CompletedPart::builder()
-                .part_number(part_number)
-                .e_tag(part.e_tag().unwrap_or_default())
-                .build(),
-        );
+        let sem = sem.clone();
+        let client = client.clone();
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let upload_id = upload_id.clone();
+        let path = path.clone();
 
-        bytes_remaining -= chunk_size as u64;
-        part_number += 1;
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let mut file = tokio::fs::File::open(&*path).await?;
+            file.seek(SeekFrom::Start(offset)).await?;
+            let mut buf = vec![0u8; chunk_size];
+            file.read_exact(&mut buf).await?;
+
+            let part = client
+                .upload_part()
+                .bucket(&*bucket)
+                .key(&*key)
+                .upload_id(&*upload_id)
+                .part_number(part_number as i32)
+                .body(ByteStream::from(buf))
+                .send()
+                .await?;
+
+            Ok::<CompletedPart, Box<dyn std::error::Error + Send + Sync>>(
+                CompletedPart::builder()
+                    .part_number(part_number as i32)
+                    .e_tag(part.e_tag().unwrap_or_default())
+                    .build(),
+            )
+        }));
     }
+
+    let mut completed_parts = Vec::with_capacity(handles.len());
+    for handle in handles {
+        completed_parts.push(handle.await??);
+    }
+    completed_parts.sort_unstable_by_key(|p| p.part_number());
 
     client
         .complete_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(upload_id)
+        .bucket(&**bucket)
+        .key(&**key)
+        .upload_id(&**upload_id)
         .multipart_upload(
             CompletedMultipartUpload::builder()
                 .set_parts(Some(completed_parts))
@@ -236,6 +303,7 @@ async fn main() -> ExitCode {
         let client = client.clone();
         let bucket = bucket.clone();
         let sem = sem.clone();
+        let multipart = args.multipart;
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -250,7 +318,7 @@ async fn main() -> ExitCode {
                 .first_or_octet_stream()
                 .to_string();
 
-            match upload_file(&client, &bucket, &file_path, &key).await {
+            match upload_file(&client, &bucket, &file_path, &key, multipart).await {
                 Ok(_) => {
                     println!("uploaded: {file_path} -> {bucket}/{key} ({content_type})");
                     true
